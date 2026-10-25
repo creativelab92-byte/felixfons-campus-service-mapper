@@ -29,6 +29,8 @@ ADVISORY_SNAPSHOT = "2026-10-25"
 PROJECT_CONTACT = "Felix Fons | https://felixfons.ru | +7 917 410-87-48"
 PHP_FIXED = {(8, 2): 35, (8, 3): 36, (8, 4): 27, (8, 5): 12}
 NODE_FIXED = {(22,): (22, 23, 4), (24,): (24, 22, 1), (26,): (26, 12, 1)}
+NGINX_FIXED_STABLE = (1, 30, 6)
+NGINX_FIXED_MAINLINE = (1, 31, 7)
 
 
 def numeric_version(value):
@@ -132,12 +134,50 @@ def security_findings(report):
                     "Проверить идентификатор образа и версию работающего процесса, затем обновить образ.",
                     "https://nodejs.org/en/blog/vulnerability/october-2026-security-releases")
 
-    nginx = numeric_version(report.get("versions_cli_only", {}).get("nginx"))
-    if nginx and (nginx < (1, 30, 6) or (1, 31, 0) <= nginx < (1, 31, 7)):
-        add("проверка", "nginx CLI = " + ".".join(map(str, nginx)),
-            "Версию нужно сверить с бюллетенями разработчика; применимость зависит от настроек и исправлений поставщика ОС.",
-            "Проверить версию работающего nginx, исправления поставщика ОС и условия каждой опубликованной ошибки; один номер версии не доказывает уязвимость.",
-            "https://nginx.org/en/security_advisories.html")
+    nginx_text = report.get("versions_cli_only", {}).get("nginx")
+    nginx_evidence = "nginx CLI"
+    if not nginx_text:
+        nginx_package = next((item for item in report.get("installed_packages", {}).get("selected", [])
+                              if item.get("package") == "nginx"), None)
+        if nginx_package:
+            nginx_text = nginx_package.get("version")
+            nginx_evidence = "установленный пакет nginx"
+    nginx = numeric_version(nginx_text)
+    signals = report.get("nginx_config_signals") or {}
+    aslr = report.get("aslr_status", "unknown")
+    if nginx and nginx[0] == 1:
+        old_branch = nginx < NGINX_FIXED_STABLE or (1, 31, 0) <= nginx < NGINX_FIXED_MAINLINE
+        if old_branch:
+            checks = [
+                ("CVE-2026-15176", nginx >= (0, 1, 29),
+                 ("alias", "rewrite", "request_filename"),
+                 "alias, rewrite и $request_filename в связанных location/log_format",
+                 "https://my.f5.com/manage/s/article/K000162416"),
+                ("CVE-2026-93479", (1, 30, 0) <= nginx < NGINX_FIXED_STABLE or
+                 (1, 31, 2) <= nginx < NGINX_FIXED_MAINLINE,
+                 ("map_regex", "capture_reference"),
+                 "map с regex и обращение к capture до результата map либо особое выражение с non-cacheable переменной",
+                 "https://my.f5.com/manage/s/article/K000162607"),
+                ("CVE-2026-97205", nginx >= (0, 8, 11),
+                 ("aio", "ssi"),
+                 "одновременное использование AIO, SSI и include virtual",
+                 "https://my.f5.com/manage/s/article/K000162608"),
+            ]
+            for cve, affected_upstream, required, condition, source in checks:
+                if not affected_upstream:
+                    continue
+                present = [name for name in required if signals.get(name)]
+                evidence = nginx_evidence + " = " + ".".join(map(str, nginx)) + "; " + cve
+                if present:
+                    evidence += "; в доступных конфигурациях есть признаки: " + ", ".join(present)
+                priority = "высокий" if len(present) == len(required) else "проверка"
+                add(priority, evidence,
+                    "Диапазон upstream-версии совпадает с бюллетенем. Риск зависит от сочетания настроек; "
+                    "RCE возможен при отключённом или обойдённом ASLR. ASLR на узле: " +
+                    {"enabled": "включён", "disabled": "выключен", "unknown": "не установлен"}.get(aslr, "не установлен") +
+                    ". Исправление поставщика ОС неизвестно.",
+                    "Проверить работающий бинарный файл, пакет и бюллетень ОС; подтвердить или исключить условие: " +
+                    condition + ". Сигналы собраны по узлу и не доказывают связь в одном обработчике запроса.", source)
 
     for command_name in ("apache2", "httpd"):
         apache = numeric_version(report.get("versions_cli_only", {}).get(command_name))
@@ -349,6 +389,14 @@ def read_config(path, warnings):
         return None
 
 
+def aslr_status():
+    try:
+        value = Path("/proc/sys/kernel/randomize_va_space").read_text(encoding="ascii").strip()
+    except OSError:
+        return "unknown"
+    return "disabled" if value == "0" else "enabled" if value in ("1", "2") else "unknown"
+
+
 def parse_upstreams(text):
     result = {}
     name = None
@@ -434,6 +482,33 @@ def nginx_inventory(warnings):
     if not entries:
         warnings.append("Локальные сайты nginx не найдены; для связи с публичными адресами нужна карта узла входа")
     return entries[:MAX_RECORDS], upstreams, certificate_paths
+
+
+def nginx_config_signals(warnings):
+    """Export only allowlisted booleans; never export nginx configuration text."""
+    signals = {key: False for key in ("alias", "rewrite", "request_filename",
+                                        "map_regex", "capture_reference", "aio", "ssi")}
+    unreadable = 0
+    paths = nginx_files(warnings)
+    for path in paths:
+        data = read_config(path, warnings)
+        if data is None:
+            unreadable += 1
+            continue
+        # Strip comments before matching. These are hints, not proof that directives
+        # are active together in the same server/location or request path.
+        data = "\n".join(line.split("#", 1)[0] for line in data.splitlines())
+        signals["alias"] |= bool(re.search(r"\balias\s+[^;]+;", data))
+        signals["rewrite"] |= bool(re.search(r"\brewrite\s+[^;]+;", data))
+        signals["request_filename"] |= "$request_filename" in data
+        signals["map_regex"] |= bool(re.search(r"\bmap\s+[^;{}]+\{[^}]*~", data, re.S))
+        signals["capture_reference"] |= bool(re.search(r"(?<![\w$])\$[1-9]\b", data))
+        signals["aio"] |= bool(re.search(r"\baio\s+(?:on|threads(?:=[^;\s]+)?)\s*;", data))
+        signals["ssi"] |= bool(re.search(r"\bssi\s+on\s*;", data))
+    signals["config_incomplete"] = bool(unreadable or not paths or
+                                        any("nginx" in warning and ("пропущен" in warning or
+                                            "недоступен" in warning) for warning in warnings))
+    return signals
 
 
 def apache_inventory(warnings):
@@ -812,6 +887,7 @@ def collect():
     if error:
         warnings.append("Список слушающих портов недоступен: " + error)
     nginx_sites, upstreams, nginx_certs = nginx_inventory(warnings)
+    config_signals = nginx_config_signals(warnings)
     apache_sites, apache_certs = apache_inventory(warnings)
     service_list = services(warnings)
     journal_counts, journal_categories = journal_error_summary()
@@ -821,6 +897,7 @@ def collect():
         "host": clean(socket.gethostname()) or "unknown",
         "os": platform.system() + " " + platform.release(),
         "distribution": distribution(),
+        "aslr_status": aslr_status(),
         "access": "current user; incomplete where permissions deny reads",
         "local_addresses": local_addresses(),
         "disk_root_used": disk_root(),
@@ -832,6 +909,7 @@ def collect():
         "service_unit_files": service_unit_files(warnings),
         "containers": docker_inventory(warnings),
         "nginx_vhosts": nginx_sites,
+        "nginx_config_signals": config_signals,
         "nginx_upstreams": upstreams,
         "apache_vhosts": apache_sites,
         "php_pools": php_pool_inventory(warnings),
@@ -1248,3 +1326,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
