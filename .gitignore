@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+campus-report-*/
+campus-combined/
+*.private.json
+inventory.private.json
+summary.txt
+service_cards.txt
+manifest.sha256
+*.zip
+*.tar.gz
