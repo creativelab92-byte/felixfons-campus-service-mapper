@@ -128,6 +128,42 @@ class MapperTests(unittest.TestCase):
         report["versions_cli_only"]["nginx"] = "nginx version: nginx/1.31.7"
         self.assertFalse(any("nginx CLI" in x["observed"] for x in m.security_findings(report)))
 
+    def test_nginx_cves_use_distinct_upstream_ranges(self):
+        report = {"versions_cli_only": {"nginx": "nginx/1.28.3"}, "listeners": []}
+        findings = m.security_findings(report)
+        labels = " ".join(x["observed"] for x in findings)
+        self.assertIn("CVE-2026-15176", labels)
+        self.assertIn("CVE-2026-97205", labels)
+        self.assertNotIn("CVE-2026-93479", labels)
+        self.assertTrue(all(x["priority"] == "проверка" for x in findings))
+
+    def test_nginx_package_is_fallback_when_cli_unavailable(self):
+        report = {"versions_cli_only": {}, "installed_packages": {"selected": [
+            {"package": "nginx", "version": "1.28.3-2ubuntu1.11"}]}, "listeners": []}
+        findings = m.security_findings(report)
+        self.assertTrue(any("установленный пакет nginx" in x["observed"] and
+                            "CVE-2026-15176" in x["observed"] for x in findings))
+
+    def test_nginx_config_signals_are_boolean_and_do_not_export_secrets(self):
+        config = ("alias /srv/secret; rewrite ^/old /new; set $x $request_filename;\n"
+                  "aio on; ssi on; map $uri $value { ~^/x $1; }\n"
+                  "proxy_set_header Authorization bearer-secret;\n")
+        with patch.object(m, "nginx_files", return_value=["/etc/nginx/example.conf"]), \
+             patch.object(m, "read_config", return_value=config):
+            signals = m.nginx_config_signals([])
+        self.assertTrue(all(signals[x] for x in ("alias", "rewrite", "request_filename",
+                                                 "map_regex", "capture_reference", "aio", "ssi")))
+        self.assertNotIn("bearer-secret", str(signals))
+        report = {"versions_cli_only": {"nginx": "nginx/1.30.5"},
+                  "nginx_config_signals": signals, "listeners": []}
+        findings = m.security_findings(report)
+        self.assertEqual({"CVE-2026-15176", "CVE-2026-93479", "CVE-2026-97205"},
+                         {next(cve for cve in ("CVE-2026-15176", "CVE-2026-93479",
+                                                "CVE-2026-97205") if cve in x["observed"])
+                          for x in findings if "CVE-2026-" in x["observed"]})
+        self.assertTrue(all("не доказывают" in x["verify_before_enable"]
+                            for x in findings if "CVE-2026-" in x["observed"]))
+
     def test_apache_october_release_is_review_candidate(self):
         report = {"php_pools": [], "versions_cli_only": {"apache2": "Server version: Apache/2.4.68"},
                   "listeners": []}
@@ -267,3 +303,4 @@ class MapperTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
