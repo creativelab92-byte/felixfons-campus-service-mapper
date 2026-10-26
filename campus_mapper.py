@@ -33,6 +33,12 @@ NGINX_FIXED_STABLE = (1, 30, 6)
 NGINX_FIXED_MAINLINE = (1, 31, 7)
 
 
+def websites(report):
+    """Common map view across Linux reverse proxies and Windows IIS."""
+    return (report.get("nginx_vhosts", []) + report.get("apache_vhosts", []) +
+            report.get("windows_websites", []))
+
+
 def numeric_version(value):
     match = re.search(r"(?<!\d)(\d{1,2})\.(\d{1,3})(?:\.(\d{1,3}))?", value or "")
     return tuple(int(x or 0) for x in match.groups()) if match else None
@@ -189,7 +195,7 @@ def security_findings(report):
 
     database_ports = {3306, 5432, 6379, 27017, 9200}
     mapped_ports = set()
-    for site in report.get("nginx_vhosts", []) + report.get("apache_vhosts", []):
+    for site in websites(report):
         mapped_ports.update(site.get("listen", []))
         for route in site.get("routes", []):
             if route.get("scope") == "loopback" and route.get("port"):
@@ -995,21 +1001,22 @@ def bind_label(value):
 def markdown(reports):
     lines = ["# Felix Fons — карта сервисов (предварительная)", "",
              "Данные собраны локально без сетевых запросов и изменений. Это инвентаризация, а не заключение о безопасности.", "",
-             "| Сервер | Время UTC | Дистрибутив | Службы | Контейнеры | Порты | Веб-сайты | Диск / |",
+             "| Сервер | Время UTC | ОС | Службы | Контейнеры | Порты | Веб-сайты | Системный диск |",
              "|---|---|---|---:|---:|---:|---:|---:|"]
     for r in reports:
         lines.append("| " + " | ".join(map(md_cell, [r.get("host"), r.get("collected_at"),
                      r.get("distribution", {}).get("pretty_name"),
                      len(r.get("services", [])), len(r.get("containers", [])),
-                     len(r.get("listeners", [])), len(r.get("nginx_vhosts", [])) + len(r.get("apache_vhosts", [])),
+                     len(r.get("listeners", [])), len(websites(r)),
                      r.get("disk_root_used")])) + " |")
     lines += ["", "## Публичные имена и локальные зависимости", "",
               "| Сервер | Имя сайта | Порт входа | Путь | Куда направляет |",
               "|---|---|---:|---|---|"]
     rows = []
     for r in reports:
-        for site in r.get("nginx_vhosts", []) + r.get("apache_vhosts", []):
-            for name in site.get("names", []):
+        for site in websites(r):
+            for name in (site.get("names") or (["IIS-сайт: " + site["site_name"]]
+                                                  if site.get("site_name") else [])):
                 routes = site.get("routes") or [{"path": "/", "kind": "static_or_unmapped", "scope": "not_mapped", "port": None}]
                 for route in routes:
                     rows.append([r["host"], name, ", ".join(map(str, site.get("listen", []))) or "?",
@@ -1187,10 +1194,11 @@ def service_cards(reports):
              " Наличие сервиса в списке не означает, что его можно включать.", ""]
     count = 0
     for r in reports:
-        sites = r.get("nginx_vhosts", []) + r.get("apache_vhosts", [])
+        sites = websites(r)
         grouped = {}
         for site in sites:
-            for name in site.get("names", []):
+            for name in (site.get("names") or (["IIS-сайт: " + site["site_name"]]
+                                                  if site.get("site_name") else [])):
                 entry = grouped.setdefault(name, {"ports": set(), "routes": []})
                 entry["ports"].update(site.get("listen", []))
                 entry["routes"].extend(site.get("routes", []))
